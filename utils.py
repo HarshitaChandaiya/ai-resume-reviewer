@@ -1,11 +1,12 @@
 """
 utils.py - Helper functions for AI Resume Reviewer Bot
-Uses the new google-genai library
+Uses the new google-genai library with retry logic for 503 errors
 """
 
 import os
 import json
 import re
+import time
 import pdfplumber
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -18,11 +19,12 @@ from google import genai
 def setup_gemini():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY not found. Set it with: set GEMINI_API_KEY=your_key")
+        raise ValueError("GEMINI_API_KEY not found. Set it in your Streamlit secrets.")
     client = genai.Client(api_key=api_key)
     return client
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-2.0-flash"  # More stable than 2.5-flash, still free
+
 # ─────────────────────────────────────────────
 # 2. PDF PARSING
 # ─────────────────────────────────────────────
@@ -51,7 +53,29 @@ def extract_text_from_pdf(uploaded_file) -> str:
     return full_text
 
 # ─────────────────────────────────────────────
-# 3. RESUME ANALYSIS
+# 3. RETRY HELPER
+# ─────────────────────────────────────────────
+
+def call_with_retry(client, prompt: str, max_retries: int = 4) -> str:
+    """Call Gemini with exponential backoff retry on 503/overload errors."""
+    delays = [3, 6, 12, 20]  # seconds to wait between retries
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(model=MODEL, contents=prompt)
+            return response.text.strip()
+        except Exception as e:
+            error_str = str(e)
+            is_overloaded = "503" in error_str or "UNAVAILABLE" in error_str or "overloaded" in error_str.lower()
+            if is_overloaded and attempt < max_retries - 1:
+                wait = delays[attempt]
+                print(f"Gemini overloaded. Retrying in {wait}s... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise ValueError(f"LLM analysis failed after {attempt + 1} attempts: {e}")
+    raise ValueError("Max retries reached. Gemini is temporarily unavailable — please try again in a minute.")
+
+# ─────────────────────────────────────────────
+# 4. RESUME ANALYSIS
 # ─────────────────────────────────────────────
 
 RESUME_ANALYSIS_PROMPT = """
@@ -88,18 +112,15 @@ Return ONLY valid JSON, nothing else.
 def analyze_resume(resume_text: str, client) -> dict:
     prompt = RESUME_ANALYSIS_PROMPT.format(resume_text=resume_text)
     try:
-        response = client.models.generate_content(model=MODEL, contents=prompt)
-        raw_output = response.text.strip()
+        raw_output = call_with_retry(client, prompt)
         raw_output = re.sub(r'^```json\s*', '', raw_output)
         raw_output = re.sub(r'\s*```$', '', raw_output)
         return json.loads(raw_output.strip())
     except json.JSONDecodeError as e:
         raise ValueError(f"LLM returned invalid JSON: {e}")
-    except Exception as e:
-        raise ValueError(f"LLM analysis failed: {e}")
 
 # ─────────────────────────────────────────────
-# 4. JOB DESCRIPTION MATCHING
+# 5. JOB DESCRIPTION MATCHING
 # ─────────────────────────────────────────────
 
 JOB_MATCH_PROMPT = """
@@ -135,18 +156,15 @@ Return ONLY valid JSON.
 def match_with_job(resume_text: str, job_description: str, client) -> dict:
     prompt = JOB_MATCH_PROMPT.format(resume_text=resume_text, job_description=job_description)
     try:
-        response = client.models.generate_content(model=MODEL, contents=prompt)
-        raw_output = response.text.strip()
+        raw_output = call_with_retry(client, prompt)
         raw_output = re.sub(r'^```json\s*', '', raw_output)
         raw_output = re.sub(r'\s*```$', '', raw_output)
         return json.loads(raw_output.strip())
     except json.JSONDecodeError as e:
         raise ValueError(f"LLM returned invalid JSON: {e}")
-    except Exception as e:
-        raise ValueError(f"Job match failed: {e}")
 
 # ─────────────────────────────────────────────
-# 5. TF-IDF SIMILARITY
+# 6. TF-IDF SIMILARITY
 # ─────────────────────────────────────────────
 
 def compute_tfidf_similarity(resume_text: str, job_description: str) -> float:
@@ -165,7 +183,7 @@ def tfidf_score_to_percent(score: float) -> int:
     return int(round(min(score * 250, 100)))
 
 # ─────────────────────────────────────────────
-# 6. HELPERS
+# 7. HELPERS
 # ─────────────────────────────────────────────
 
 def highlight_keywords(text: str, keywords: list) -> str:
